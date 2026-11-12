@@ -1,0 +1,33 @@
+{
+  "passed": true,
+  "checks": [
+    "empty state",
+    "automatic recommendations after account connection",
+    "queue",
+    "settings persistence",
+    "pairing",
+    "feed",
+    "search",
+    "pinned filter",
+    "actual H.264 playback",
+    "compact layout"
+  ],
+  "accessibility": [
+    {
+      "name": "empty",
+      "violations": []
+    },
+    {
+      "name": "settings",
+      "violations": []
+    },
+    {
+      "name": "library",
+      "violations": []
+    },
+    {
+      "name": "compact",
+      "violations": []
+    }
+  ]
+}

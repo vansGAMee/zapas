@@ -1,0 +1,1 @@
+<resources><style name="Theme.Zapas" parent="android:style/Theme.Material.NoActionBar"><item name="android:fontFamily">sans</item><item name="android:windowLightStatusBar">false</item><item name="android:windowActionModeOverlay">true</item><item name="android:colorAccent">#FF455D</item><item name="android:windowBackground">#0F0F0F</item></style></resources>

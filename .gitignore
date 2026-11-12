@@ -1,0 +1,14 @@
+.venv/
+node_modules/
+.private/
+__pycache__/
+.pytest_cache/
+android/.gradle/
+android/.kotlin/
+android/local.properties
+**/build/
+artifacts/*.log
+artifacts/test-library/
+dist/
+*.jks
+*.keystore
