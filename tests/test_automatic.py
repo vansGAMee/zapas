@@ -1,7 +1,8 @@
 import concurrent.futures
 import time
 
-from zapas.account import LoginRequired, PlatformLimited
+from zapas.account import Account, LoginRequired, PlatformLimited
+import pytest
 from zapas.media import Pipeline, offline_reason
 from zapas.store import Store
 
@@ -16,6 +17,32 @@ def test_personal_feed_requires_authenticated_session(tmp_path):
     pipe.refresh()
     assert not s.all("SELECT id FROM videos")
     assert "Войди" in s.one("SELECT error FROM sources WHERE id='auto-recommendations'")["error"]
+
+
+def test_refresh_cannot_close_an_unfinished_login(tmp_path, monkeypatch):
+    account = Account(tmp_path)
+    account.headed = True
+    monkeypatch.setattr(account, '_start', lambda **_: pytest.fail('Must not replace a login window'))
+    with pytest.raises(LoginRequired):
+        account.recommendations(10)
+
+
+def test_authenticated_feed_reuses_login_window_and_does_not_stop_it(tmp_path, monkeypatch):
+    account = Account(tmp_path)
+    account.connected = True
+    account.headed = True
+    account.process = type('Running', (), {'poll': lambda _: None})()
+    class Page:
+        def call(self, method, params=None):
+            assert method != 'Page.navigate', 'Do not navigate away from the authenticated tab'
+        def evaluate(self, script):
+            return {'loggedIn':True,'videos':[{'url':'https://www.youtube.com/watch?v=00000000001','title':'Personal'}]}
+        def close(self): pass
+    monkeypatch.setattr(account, '_page', lambda: Page())
+    monkeypatch.setattr(account, '_start', lambda **_: pytest.fail('Must reuse the authenticated browser'))
+    monkeypatch.setattr(account, 'stop', lambda: pytest.fail('Must not close the user login window'))
+    assert len(account.recommendations(1)) == 1
+    assert account.marker.exists()
 
 
 def test_feed_enqueues_automatically_deduplicates_and_caps(tmp_path):
@@ -58,6 +85,29 @@ def test_rate_limit_causes_long_stop_without_retry_storm(tmp_path):
     assert "pause" in s.one("SELECT error FROM sources")["error"]
     # The downloader never receives the Google session.
     assert not {"cookiefile", "cookiesfrombrowser"} & pipe.options().keys()
+
+
+def test_cooldown_from_refresh_stops_already_queued_downloads(tmp_path, monkeypatch):
+    s = Store(tmp_path)
+    pipe = Pipeline(s)
+    pipe.enqueue('https://www.youtube.com/watch?v=00000000001')
+    processed = []
+    class Limited:
+        connected = True
+        def poll_login(self): return False
+        def recommendations(self, *_): raise PlatformLimited('Pause requested')
+    pipe.account = Limited()
+    monkeypatch.setattr(pipe, 'process', lambda *_: processed.append(True))
+    pipe.start()
+    try:
+        deadline = time.monotonic() + 2
+        while s.settings()['cooldown_until'] == 0 and time.monotonic() < deadline:
+            time.sleep(.01)
+        assert s.settings()['cooldown_until'] > time.time()
+        assert not processed
+    finally:
+        pipe.stop.set()
+        pipe.thread.join(timeout=3)
 
 
 def test_live_and_upcoming_videos_cannot_start_unbounded_downloads():

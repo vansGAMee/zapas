@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from .media import PROFILES, Pipeline, youtube_url, canonical_video, is_source
 from .store import Store
+from .discovery import Discovery
 
 
 def lan_addresses(port):
@@ -74,6 +75,11 @@ class ProgressBody(BaseModel):
 def create_app(store=None, start_worker=True, port=9473):
     s = store or Store()
     pipeline = Pipeline(s)
+    server_id = s.settings().get('server_id')
+    if not server_id:
+        server_id = uuid.uuid4().hex
+        s.save_settings({'server_id': server_id})
+    discovery = Discovery(port, server_id)
     admin_token = secrets.token_urlsafe(32)
     pairing = {"code": "", "expires": 0, "attempts": 0}
 
@@ -81,13 +87,15 @@ def create_app(store=None, start_worker=True, port=9473):
     async def lifespan(app):
         if start_worker:
             pipeline.start()
+            discovery.start()
         yield
+        discovery.close()
         pipeline.stop.set()
         if pipeline.thread:
             pipeline.thread.join(timeout=20)
         pipeline.account.stop()
 
-    app = FastAPI(title="Запас", version="0.1.0", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+    app = FastAPI(title="Запас", version="0.2.0", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.store, app.state.pipeline, app.state.admin_token = s, pipeline, admin_token
 
     @app.middleware("http")
@@ -127,7 +135,21 @@ def create_app(store=None, start_worker=True, port=9473):
 
     @app.get("/api/health")
     def health():
-        return {"name": "Запас", "version": 1}
+        return {"name": "Запас", "version": 1, "app_version": "0.2.0", "server_id": server_id}
+
+    @app.get('/phone')
+    def phone_setup():
+        return FileResponse(Path(__file__).resolve().parent.parent / 'web' / 'phone.html')
+
+    @app.get('/api/install/android')
+    def install_android():
+        base = Path(__file__).resolve().parents[2]
+        candidates = [base / 'android/app/build/outputs/apk/debug/app-debug.apk',
+                      base / 'dist/Zapas-0.2.0.apk', Path(__file__).resolve().parent.parent / 'Zapas.apk']
+        apk = next((p for p in candidates if p.is_file()), None)
+        if not apk:
+            raise HTTPException(404, 'APK не найден. Открой папку Запас на рабочем столе ПК.')
+        return FileResponse(apk, filename='Zapas-0.2.0.apk', media_type='application/vnd.android.package-archive')
 
     @app.get("/api/state", dependencies=[Depends(admin)])
     def state():
@@ -153,7 +175,11 @@ def create_app(store=None, start_worker=True, port=9473):
     def manifest(identity=Depends(auth)):
         rows = s.all("SELECT id,title,channel,duration,bytes,sha256,height,codec,pinned,created FROM videos WHERE state='ready' ORDER BY pinned DESC,created DESC")
         progress = s.all("SELECT video_id,position,watched,updated FROM progress WHERE device_id=?", (identity,))
-        return {"version": 1, "videos": rows, "progress": progress, "generated": time.time()}
+        cfg = s.settings()
+        preparation = s.one("SELECT state,progress FROM videos WHERE state IN ('downloading','compressing') LIMIT 1")
+        pending = s.one("SELECT count(*) AS n FROM videos WHERE state IN ('queued','downloading','compressing')")['n']
+        return {"version": 1, "videos": rows, "progress": progress, "generated": time.time(),
+                'preparation': preparation, 'pending': pending, 'paused': cfg['paused'], 'transfers_paused': cfg['transfers_paused'], 'cooldown_until': cfg['cooldown_until']}
 
     @app.post("/api/videos", dependencies=[Depends(admin)])
     def add_video(body: ImportBody):
@@ -210,11 +236,11 @@ def create_app(store=None, start_worker=True, port=9473):
     @app.get("/api/preferences", dependencies=[Depends(auth)])
     def device_preferences():
         cfg = s.settings()
-        return {"profile": cfg["profile"], "codec": cfg["codec"]}
+        return {"profile": cfg["profile"], "codec": cfg["codec"], 'encoding_mode': cfg['encoding_mode']}
 
     @app.post("/api/preferences", dependencies=[Depends(auth)])
     def update_preferences(body: dict):
-        if set(body) != {"profile", "codec"} or not isinstance(body.get("profile"), str) or body.get("profile") not in PROFILES or body.get("codec") not in ("h264", "hevc", "av1"):
+        if not {'profile','codec'} <= set(body) or set(body) - {'profile','codec','encoding_mode'} or body.get('encoding_mode', 'smart') not in ('smart','small','fast') or not isinstance(body.get("profile"), str) or body.get("profile") not in PROFILES or body.get("codec") not in ("h264", "hevc", "av1"):
             raise HTTPException(422, "Проверь профиль сжатия")
         s.save_settings(body)
         return body
@@ -244,10 +270,12 @@ def create_app(store=None, start_worker=True, port=9473):
     def settings(body: dict):
         validators = {
             "profile": lambda x: x in PROFILES, "codec": lambda x: x in ("h264", "hevc", "av1"),
-            "max_videos": lambda x: type(x) is int and 1 <= x <= 500,
+            'encoding_mode': lambda x: x in ('smart','small','fast'),
+            "max_videos": lambda x: type(x) is int and 1 <= x <= 1000,
             "max_gb": lambda x: type(x) in (int, float) and 0.1 <= x <= 1000,
             "download_mibps": lambda x: type(x) in (int, float) and 0 <= x <= 100,
             "auto_refresh": lambda x: type(x) is bool, "paused": lambda x: type(x) is bool,
+            'transfers_paused': lambda x: type(x) is bool,
             "refresh_hours": lambda x: type(x) is int and 6 <= x <= 168,
             "daily_limit": lambda x: type(x) is int and 10 <= x <= 100,
             "auto_clean": lambda x: type(x) is bool,
@@ -301,7 +329,7 @@ def create_app(store=None, start_worker=True, port=9473):
         from urllib.parse import urlencode
         if address not in lan_addresses(port) or pairing["expires"] < time.time():
             raise HTTPException(400, "Создай новый код подключения")
-        qr = qrcode.make("zapas://pair?" + urlencode({"address": address, "code": pairing["code"]}))
+        qr = qrcode.make(address + '/phone#' + urlencode({"address": address, "code": pairing["code"]}))
         buf = io.BytesIO()
         qr.save(buf, format="PNG")
         return Response(buf.getvalue(), media_type="image/png")
@@ -314,7 +342,7 @@ def create_app(store=None, start_worker=True, port=9473):
         token, key = secrets.token_urlsafe(32), uuid.uuid4().hex
         s.execute("INSERT INTO devices (id,name,token_hash,last_seen) VALUES (?,?,?,?)", (key, body.name, hashlib.sha256(token.encode()).hexdigest(), time.time()))
         pairing["expires"] = 0
-        return {"token": token, "device_id": key}
+        return {"token": token, "device_id": key, "server_id": server_id}
 
     @app.delete("/api/devices/{key}", dependencies=[Depends(admin)])
     def revoke(key: str):
@@ -347,8 +375,10 @@ def create_app(store=None, start_worker=True, port=9473):
             raise HTTPException(404, "Обложка не найдена")
         return FileResponse(path, media_type="image/jpeg")
 
-    @app.api_route("/api/media/{key}", methods=["GET", "HEAD"], dependencies=[Depends(auth)])
-    def media(key: str, request: Request):
+    @app.api_route("/api/media/{key}", methods=["GET", "HEAD"])
+    def media(key: str, request: Request, identity=Depends(auth)):
+        if identity != 'admin' and s.settings()['transfers_paused']:
+            raise HTTPException(423, 'Передача новых видео приостановлена на ПК. Скачанное доступно офлайн.')
         row = s.one("SELECT media,sha256 FROM videos WHERE id=? AND state='ready'", (key,))
         path = s.root / "media" / Path(row["media"]).name if row and row["media"] else None
         if not path or not path.is_file():
@@ -372,10 +402,15 @@ def create_app(store=None, start_worker=True, port=9473):
         if request.method == "HEAD":
             return Response(status_code=status, headers=headers)
         def chunks():
+            checked = 0.0
             with path.open("rb") as f:
                 f.seek(start)
                 left = end - start + 1
                 while left:
+                    if identity != 'admin' and time.monotonic() - checked > 1:
+                        checked = time.monotonic()
+                        if s.settings()['transfers_paused']:
+                            break
                     block = f.read(min(left, 256 * 1024))
                     if not block:
                         break

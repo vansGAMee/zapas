@@ -16,7 +16,7 @@ import java.util.concurrent.TimeUnit
 class SyncWorker(context: Context, parameters: WorkerParameters) : CoroutineWorker(context, parameters) {
     override suspend fun doWork(): Result {
         val repo = applicationContext.repo()
-        if (!repo.paired) return Result.success()
+        if (!repo.paired || repo.phonePaused) return Result.success()
         return try {
             withTimeout(TimeUnit.MINUTES.toMillis(8)) {
                 setForeground(notification("Проверяем медиатеку на компьютере"))
@@ -29,9 +29,7 @@ class SyncWorker(context: Context, parameters: WorkerParameters) : CoroutineWork
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            repo.status.value = if (e is java.net.ConnectException || e is java.net.SocketTimeoutException || e is java.net.UnknownHostException)
-                "Домашний ПК недоступен. Скачанные видео остаются с тобой."
-            else e.message?.take(180) ?: "ПК недоступен. Проверь домашний Wi‑Fi."
+            repo.status.value = repo.connectionError(e)
             if (runAttemptCount < 3) Result.retry() else Result.failure()
         }
     }
@@ -49,13 +47,13 @@ class SyncWorker(context: Context, parameters: WorkerParameters) : CoroutineWork
     companion object {
         fun schedule(context: Context) {
             val p = context.repo().prefs
-            if (!p.getBoolean("auto_sync", true)) {
+            if (!p.getBoolean("auto_sync", true) || p.getBoolean("downloads_paused",false)) {
                 WorkManager.getInstance(context).cancelUniqueWork("zapas-periodic")
                 return
             }
             val constraints = Constraints.Builder().setRequiredNetworkType(NetworkType.UNMETERED).setRequiresStorageNotLow(true)
                 .setRequiresBatteryNotLow(true).setRequiresCharging(p.getBoolean("charging_only", false)).build()
-            val request = PeriodicWorkRequestBuilder<SyncWorker>(15, TimeUnit.MINUTES).setConstraints(constraints)
+            val request = PeriodicWorkRequestBuilder<SyncWorker>(p.getInt("sync_minutes",15).coerceAtLeast(15).toLong(), TimeUnit.MINUTES).setConstraints(constraints)
                 .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS).addTag("zapas-sync").build()
             WorkManager.getInstance(context).enqueueUniquePeriodicWork("zapas-periodic", ExistingPeriodicWorkPolicy.UPDATE, request)
         }

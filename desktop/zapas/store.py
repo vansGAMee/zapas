@@ -10,6 +10,8 @@ DEFAULTS = {
     "max_gb": 16, "auto_refresh": True, "refresh_hours": 6,
     "browser": "", "paused": False, "download_mibps": 4, "autostart": False,
     "daily_limit": 80, "next_job_at": 0, "cooldown_until": 0, "auto_clean": True,
+    "encoding_mode": "smart",
+    "transfers_paused": False,
 }
 
 

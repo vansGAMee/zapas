@@ -4,3 +4,5 @@
 .field textarea{width:100%;min-height:160px;resize:vertical;line-height:1.6}.batch-details{margin-top:16px;padding:14px;background:var(--surface-high);border-radius:12px;font-size:13px;line-height:1.7}.batch-details p{color:var(--error);overflow-wrap:anywhere}.queue-actions{display:flex;gap:8px;flex-wrap:wrap}
 
 [hidden]{display:none!important}
+
+svg.settings-icon{fill:currentColor;stroke:none}

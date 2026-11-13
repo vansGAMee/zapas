@@ -52,6 +52,17 @@ def test_pairing_throttle(setup):
     pair(c, admin)
 
 
+def test_phone_transfer_pause_preserves_local_playback(setup):
+    store, _, c, admin = setup
+    key, data = ready(store)
+    _, phone = pair(c, admin)
+    assert c.patch('/api/settings',headers=admin,json={'transfers_paused':True,'paused':True}).status_code == 200
+    assert c.get('/api/manifest',headers=phone).json()['transfers_paused'] is True
+    assert c.get('/api/media/'+key,headers=phone).status_code == 423
+    assert c.get('/api/media/'+key,headers=admin).content == data
+    assert store.one('SELECT state FROM videos WHERE id=?',(key,))['state']=='ready'
+
+
 def test_resumable_transfer_hash_and_ranges(setup):
     store, app, c, admin = setup
     key, data = ready(store)

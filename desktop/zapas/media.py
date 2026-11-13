@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -57,19 +58,46 @@ def probe(path):
     v = next((s for s in d["streams"] if s["codec_type"] == "video"), None)
     if not v:
         raise ValueError("В файле нет видеодорожки")
+    v['_audio'] = next((s for s in d['streams'] if s['codec_type']=='audio'), {})
     return float(d["format"].get("duration", 0)), v
 
 
-def encode_args(src, dst, profile="balanced", codec="h264"):
+def encode_args(src, dst, profile="balanced", codec="h264", mode="smart"):
     p = PROFILES[profile]
     height = p["height"]
     # Preserve aspect ratio, don't upscale, keep both dimensions even.
     scale = f"scale=w='trunc(iw*min(1,{height}/ih)/2)*2':h='trunc(ih*min(1,{height}/ih)/2)*2',fps=fps='min(source_fps,30)'"
-    enc = {"h264": ["-c:v", "libx264", "-preset", "medium", "-crf", str(p["crf"])],
-           "hevc": ["-c:v", "libx265", "-preset", "medium", "-crf", str(p["crf"] + 2), "-tag:v", "hvc1", "-x265-params", "pools=2"],
+    preset = "medium" if mode == "small" else "veryfast"
+    enc = {"h264": ["-c:v", "libx264", "-preset", preset, "-crf", str(p["crf"])],
+           "hevc": ["-c:v", "libx265", "-preset", preset, "-crf", str(p["crf"] + 2), "-tag:v", "hvc1", "-x265-params", "pools=2"],
            "av1": ["-c:v", "libsvtav1", "-preset", "8", "-crf", str(p["crf"] + 9), "-svtav1-params", "lp=2"]}[codec]
-    return ["ffmpeg", "-hide_banner", "-y", "-filter_threads", "1", "-i", str(src), "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn", "-vf", scale,
+    return ["ffmpeg", "-hide_banner", "-y", "-filter_threads", "1", "-threads", "2", "-i", str(src), "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn", "-vf", scale,
             *enc, "-pix_fmt", "yuv420p", "-threads", "2", "-c:a", "aac", "-b:a", p["audio"], "-ac", "2", "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", str(dst)]
+
+
+def can_copy_video(stream, profile, codec):
+    try:
+        rate = str(stream.get('avg_frame_rate', '0/1')).split('/')
+        fps = float(rate[0]) / float(rate[1]) if len(rate) == 2 else float(rate[0])
+        height = int(stream.get('height', 0))
+    except (ValueError, TypeError, ZeroDivisionError):
+        return False
+    return stream.get('codec_name') == codec and 0 < height <= PROFILES[profile]['height'] and 0 < fps <= 30.1 and stream.get('pix_fmt') == 'yuv420p'
+
+
+def can_copy_audio(stream, profile):
+    try:
+        bitrate, channels = int(stream.get('bit_rate', 0)), int(stream.get('channels', 0))
+    except (ValueError, TypeError):
+        return False
+    return stream.get('codec_name') == 'aac' and 0 < bitrate <= int(PROFILES[profile]['audio'][:-1]) * 1000 and 0 < channels <= 2
+
+
+def remux_args(src, dst, profile, copy_audio=False):
+    audio = ['-c:a','copy'] if copy_audio else ['-c:a','aac','-b:a',PROFILES[profile]['audio'],'-ac','2']
+    return ['ffmpeg','-hide_banner','-y','-threads','2','-i',str(src),'-map','0:v:0','-map','0:a:0?',
+            '-c:v','copy',*audio,'-threads','2',
+            '-movflags','+faststart','-progress','pipe:1','-nostats',str(dst)]
 
 
 def sha256(path):
@@ -173,7 +201,7 @@ class Pipeline:
             try:
                 if source["id"] == "auto-recommendations":
                     # Even manual refresh cannot hammer the signed-in home page.
-                    if time.time() - source["last_refresh"] < 20 * 60:
+                    if time.time() - source["last_refresh"] < (5 * 60 if source["error"] else 20 * 60):
                         continue
                     recommendations = self.account.recommendations(cfg["max_videos"], self.stop)
                     self.enqueue_many([(v["url"], v["title"]) for v in recommendations])
@@ -208,7 +236,7 @@ class Pipeline:
                 if self.account.poll_login():
                     self.s.execute("UPDATE sources SET last_refresh=0,error='' WHERE id='auto-recommendations'")
                     self.refresh_requested.set()
-                if cfg["auto_clean"] and time.monotonic() - self.last_cleanup > 60:
+                if cfg["auto_clean"] and not cfg["paused"] and not cfg["transfers_paused"] and time.monotonic() - self.last_cleanup > 60:
                     self.last_cleanup = time.monotonic()
                     self.clean_watched()
                 if cfg["paused"]:
@@ -217,10 +245,15 @@ class Pipeline:
                 if cfg["cooldown_until"] > time.time():
                     self.stop.wait(5)
                     continue
-                due = self.s.one("SELECT id FROM sources WHERE enabled=1 AND last_refresh<?", (time.time() - cfg["refresh_hours"] * 3600,))
+                due = self.s.one("SELECT id FROM sources WHERE enabled=1 AND (last_refresh<? OR (error!='' AND last_refresh<?))", (time.time() - cfg["refresh_hours"] * 3600, time.time() - 300))
+                if due and due['id'] == 'auto-recommendations' and not self.account.connected:
+                    due = None
                 if self.refresh_requested.is_set() or (cfg["auto_refresh"] and due):
                     self.refresh_requested.clear()
                     self.refresh()
+                    cfg = self.s.settings()
+                    if cfg["cooldown_until"] > time.time():
+                        continue
                 item = self.s.one("SELECT * FROM videos WHERE state='queued' ORDER BY created LIMIT 1")
                 if not item:
                     item = self.s.one("SELECT v.* FROM videos v WHERE state='error' AND (SELECT count(*) FROM attempts a WHERE a.video_id=v.id AND a.started>?)<3 AND coalesce((SELECT max(started) FROM attempts a WHERE a.video_id=v.id),0)<? ORDER BY created LIMIT 1", (time.time()-86400,time.time()-1800))
@@ -229,7 +262,8 @@ class Pipeline:
                         self.stop.wait(5)
                         continue
                     used = self.s.one("SELECT coalesce(sum(bytes),0) AS n FROM videos WHERE state='ready'")["n"]
-                    if used >= cfg["max_gb"] * 1024**3:
+                    count = self.s.one("SELECT count(*) AS n FROM videos WHERE state='ready'")["n"]
+                    if used >= cfg["max_gb"] * 1024**3 or count >= cfg['max_videos']:
                         self.stop.wait(5)
                         continue
                     self.s.execute("INSERT INTO attempts VALUES (?,?)", (item["id"], time.time()))
@@ -239,6 +273,7 @@ class Pipeline:
                 else:
                     self.stop.wait(2)
             except Exception:
+                logging.getLogger(__name__).exception("Library worker failed; retrying in three seconds")
                 self.stop.wait(3)
 
     def process(self, item, cfg):
@@ -251,11 +286,13 @@ class Pipeline:
             self.s.update_video(key, state="downloading", error="", progress=0)
             if item["local_path"]:
                 src = Path(item["local_path"])
+            elif item['original_bytes'] and item['duration'] and (work / 'source.mp4').is_file():
+                src = work / 'source.mp4'
             else:
                 import yt_dlp
                 def hook(d):
-                    if self.stop.is_set():
-                        raise RuntimeError("Загрузка остановлена")
+                    if self.stop.is_set() or self.s.settings()['paused']:
+                        raise RuntimeError("Подготовка на паузе")
                     if shutil.disk_usage(self.s.root).free < 512 * 1024**2:
                         raise RuntimeError("На диске ПК осталось меньше 512 МБ. Освободи место и повтори загрузку.")
                     total = d.get("total_bytes") or d.get("total_bytes_estimate") or 1
@@ -278,12 +315,19 @@ class Pipeline:
                 if not src.exists():
                     src = next(p for p in work.glob("source.*") if p.suffix in {".mp4", ".webm", ".mkv"})
                 self.s.update_video(key, title=info.get("title", item["title"]), channel=info.get("uploader", "YouTube"))
-            duration, _ = probe(src)
+            duration, source_stream = probe(src)
             self.s.update_video(key, state="compressing", progress=0, duration=duration, original_bytes=src.stat().st_size)
             dst = work / "encoded.mp4"
+            mode = cfg.get('encoding_mode', 'smart')
+            compatible = can_copy_video(source_stream, cfg['profile'], cfg['codec'])
+            audio = source_stream.get('_audio', {})
+            copy_audio = can_copy_audio(audio, cfg['profile'])
+            bitrate = src.stat().st_size * 8 / max(duration, 1)
+            copy_video = compatible and (mode == 'fast' or mode == 'smart' and bitrate <= {'compact':800000,'balanced':1600000,'quality':3000000}[cfg['profile']])
+            command = remux_args(src, dst, cfg['profile'], copy_audio) if copy_video else encode_args(src, dst, cfg['profile'], cfg['codec'], mode)
             # stderr goes to a file, avoiding a full-pipe deadlock on long encodes.
             with open(work / "ffmpeg.log", "w+") as log:
-                proc = subprocess.Popen(encode_args(src, dst, cfg["profile"], cfg["codec"]), stdout=subprocess.PIPE, stderr=log, text=True,
+                proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=log, text=True,
                                         creationflags=subprocess.BELOW_NORMAL_PRIORITY_CLASS if os.name == "nt" else 0)
                 if os.name == "posix":
                     try:
@@ -291,10 +335,10 @@ class Pipeline:
                     except (ProcessLookupError, PermissionError):
                         pass
                 for line in proc.stdout:
-                    if self.stop.is_set():
+                    if self.stop.is_set() or self.s.settings()['paused']:
                         proc.terminate()
                         proc.wait(timeout=15)
-                        raise RuntimeError("Подготовка остановлена")
+                        raise RuntimeError("Подготовка на паузе")
                     if shutil.disk_usage(self.s.root).free < 256 * 1024**2:
                         proc.terminate()
                         proc.wait(timeout=15)
@@ -307,6 +351,9 @@ class Pipeline:
                 if proc.wait() != 0:
                     log.seek(0)
                     raise RuntimeError("FFmpeg: " + log.read()[-600:])
+            if compatible and not copy_video and dst.stat().st_size > src.stat().st_size:
+                # Re-encoding an efficient source must not make the stored file larger.
+                subprocess.run(remux_args(src, dst, cfg['profile'], copy_audio), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=max(120, duration))
             _, stream = probe(dst)
             total = self.s.one("SELECT coalesce(sum(bytes),0) AS n FROM videos WHERE state='ready'")["n"]
             if total + dst.stat().st_size > cfg["max_gb"] * 1024**3:
@@ -328,6 +375,9 @@ class Pipeline:
             if re.search(r"HTTP Error (403|429)|too many requests|confirm you.re not a bot|unusual traffic|captcha", message, re.I):
                 self.protect("YouTube ограничил запросы. Автоматика остановлена на 12 часов, без обхода проверок.")
             unavailable = bool(re.search(r"video unavailable|private video|video is not available|members.only|confirm your age|removed by", message, re.I))
-            self.s.update_video(key, state="archived" if unavailable else "error", error=message, progress=0)
+            paused = self.stop.is_set() or self.s.settings()['paused']
+            self.s.update_video(key, state="queued" if paused else "archived" if unavailable else "error", error='' if paused else message, progress=0)
         finally:
-            shutil.rmtree(work, ignore_errors=True)
+            final_state = self.s.one('SELECT state FROM videos WHERE id=?', (key,))
+            if final_state and final_state['state'] in ('ready', 'archived'):
+                shutil.rmtree(work, ignore_errors=True)

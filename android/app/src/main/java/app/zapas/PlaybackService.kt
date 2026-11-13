@@ -11,9 +11,12 @@ import kotlinx.coroutines.*
 class PlaybackService : MediaSessionService() {
     private var session: MediaSession? = null
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var lastSavedId: String? = null
+    private var lastSavedPosition = -1L
     override fun onCreate() {
         super.onCreate()
         val player = ExoPlayer.Builder(this).build().apply {
+            setPlaybackSpeed(repo().prefs.getFloat("playback_speed",1f))
             setAudioAttributes(AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_MOVIE).build(), true)
             setHandleAudioBecomingNoisy(true)
         }
@@ -33,11 +36,18 @@ class PlaybackService : MediaSessionService() {
             }
             override fun onIsPlayingChanged(isPlaying: Boolean) { if (!isPlaying) save() }
         })
-        scope.launch { while (isActive) { delay(3000); save() } }
+        scope.launch { while (isActive) {
+            delay(1000)
+            val deadline=repo().sleepDeadline.value
+            if(deadline>0&&System.currentTimeMillis()>=deadline){player.pause();repo().sleepDeadline.value=0}
+            save()
+        } }
     }
     private fun save(ended: Boolean = false) {
         val p = session?.player ?: return
         val id = p.currentMediaItem?.mediaId ?: return
+        if(!ended&&id==lastSavedId&&kotlin.math.abs(p.currentPosition-lastSavedPosition)<3000)return
+        lastSavedId=id;lastSavedPosition=p.currentPosition
         repo().progress(id, if (ended) 0 else p.currentPosition, ended)
     }
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = session

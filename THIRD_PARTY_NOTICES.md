@@ -13,3 +13,5 @@
 YouTube — товарный знак Google. Запас — независимое приложение, не официальный клиент YouTube. Google-аккаунт и сервис YouTube этим приложением не предоставляются.
 
 Перед распространением бинарных сборок сохраните полные лицензионные тексты и выполните требования поставляемой сборки FFmpeg/Qt. CI в этом репозитории является заготовкой сборки, а не юридической проверкой распространения.
+
+Google Material Design Icons: значок settings из https://github.com/google/material-design-icons, Apache License 2.0. Android использует стандартные Material Icons из зависимостей Compose. Переносимая Windows-сборка дополнительно содержит CPython (PSF), Node.js (MIT), FFmpeg (лицензия и ссылка на исходники поставщика Gyan.dev); лицензии Python и Python-пакетов сохранены внутри runtime.

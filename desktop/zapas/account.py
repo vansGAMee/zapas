@@ -4,6 +4,7 @@ Google credentials stay in Chrome/Chromium/Edge. Only public video links and
 titles cross the local DevTools connection. No likes, watches or account writes.
 """
 import json
+import logging
 import os
 import shutil
 import socket
@@ -14,7 +15,7 @@ import urllib.request
 from pathlib import Path
 
 
-CAPTURE_SCRIPT = """(()=>({loggedIn:(()=>{const v=window.ytcfg?.get?.('LOGGED_IN');return typeof v==='boolean'?v:Boolean(document.querySelector('#avatar-btn img'))})(), limited:!!document.querySelector('iframe[src*=recaptcha]')||/confirm you.re not a bot|unusual traffic|подтвердите.{0,30}не робот/i.test(document.body?.innerText||''), videos:[...document.querySelectorAll('ytd-rich-item-renderer a[href*="/watch?v="],yt-lockup-view-model a[href*="/watch?v="]')].map(a=>{let id=new URL(a.href).searchParams.get('v');let card=a.closest('ytd-rich-item-renderer,yt-lockup-view-model');return {url:'https://www.youtube.com/watch?v='+id,title:card?.querySelector('#video-title,h3')?.textContent?.trim()||a.getAttribute('title')||''}}).filter(v=>/^https:\\/\\/www\\.youtube\\.com\\/watch\\?v=[\\w-]{11}$/.test(v.url))}))()"""
+CAPTURE_SCRIPT = """(()=>({loggedIn:(()=>{const v=window.ytcfg?.get?.('LOGGED_IN');return typeof v==='boolean'?v:document.querySelector('#avatar-btn img')?true:null})(), limited:!!document.querySelector('iframe[src*=recaptcha]')||/confirm you.re not a bot|unusual traffic|подтвердите.{0,30}не робот/i.test(document.body?.innerText||''), videos:[...document.querySelectorAll('ytd-rich-item-renderer a[href*="/watch?v="],yt-lockup-view-model a[href*="/watch?v="]')].map(a=>{let id=new URL(a.href).searchParams.get('v');let card=a.closest('ytd-rich-item-renderer,yt-lockup-view-model');return {url:'https://www.youtube.com/watch?v='+id,title:card?.querySelector('#video-title,h3')?.textContent?.trim()||a.getAttribute('title')||''}}).filter(v=>/^https:\\/\\/www\\.youtube\\.com\\/watch\\?v=[\\w-]{11}$/.test(v.url))}))()"""
 
 class LoginRequired(Exception):
     pass
@@ -87,6 +88,7 @@ class Account:
         self.message = "YouTube подключён" if self.connected else "Войди в YouTube один раз — дальше всё автоматически"
         self.lock = threading.RLock()
         self.last_poll = 0
+        self.login_detected = False
 
     def state(self):
         return {"connected": self.connected, "message": self.message, "browser_available": bool(find_browser()), "login_open": bool(self.process and self.process.poll() is None and self.headed)}
@@ -94,13 +96,29 @@ class Account:
     def stop(self):
         with self.lock:
             if self.process and self.process.poll() is None:
-                # This is only the browser started by this application with its own profile.
-                self.process.terminate()
+                # Browser.close flushes the profile. SIGTERM immediately after sign-in
+                # could discard the new session before Chrome has written it to disk.
+                page = None
                 try:
-                    self.process.wait(timeout=8)
+                    page = self._page()
+                    page.call("Browser.close")
+                except Exception:
+                    pass
+                finally:
+                    if page:
+                        try:
+                            page.close()
+                        except Exception:
+                            pass
+                try:
+                    self.process.wait(timeout=10)
                 except subprocess.TimeoutExpired:
-                    self.process.kill()
-                    self.process.wait(timeout=5)
+                    self.process.terminate()
+                    try:
+                        self.process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        self.process.kill()
+                        self.process.wait(timeout=5)
             self.process = None
 
     def _start(self, headed=False):
@@ -162,22 +180,24 @@ class Account:
 
     def open_login(self):
         with self.lock:
+            self.login_detected = False
             self.message = "Войди в свой аккаунт в открывшемся окне YouTube"
             self._start(headed=True)
 
     def poll_login(self):
-        if not self.headed or not self.process or self.process.poll() is not None or time.monotonic() - self.last_poll < 5:
+        if self.login_detected or not self.headed or not self.process or self.process.poll() is not None or time.monotonic() - self.last_poll < 5:
             return False
         self.last_poll = time.monotonic()
         with self.lock:
             page = None
             try:
                 page = self._page()
-                logged_in = page.evaluate("(()=>{const v=window.ytcfg?.get?.('LOGGED_IN');return typeof v==='boolean'?v:Boolean(document.querySelector('#avatar-btn img'))})()")
+                logged_in = page.evaluate("(()=>{const v=window.ytcfg?.get?.('LOGGED_IN');return typeof v==='boolean'?v:document.querySelector('#avatar-btn img')?true:null})()")
                 if not logged_in:
                     return False
                 self.marker.write_text("1")
                 self.connected = True
+                self.login_detected = True
                 self.message = "YouTube подключён. Готовим твои рекомендации."
                 return True
             except Exception:
@@ -188,15 +208,20 @@ class Account:
 
     def recommendations(self, limit, stop=None):
         with self.lock:
-            if not self.marker.exists() and not self.headed:
+            if not self.connected:
                 raise LoginRequired(self.message)
-            self._start(headed=False)
+            # Read the already authenticated tab first. Never replace a sign-in
+            # window with another browser while Google is finishing sign-in.
+            reuse_login = bool(self.headed and self.process and self.process.poll() is None)
+            if not reuse_login:
+                self._start(headed=False)
             page = self._page()
             try:
                 page.call("Network.enable")
                 page.call("Network.setBlockedURLs", {"urls": ["*://*.googlevideo.com/*"]})
                 page.call("Page.addScriptToEvaluateOnNewDocument", {"source": "HTMLMediaElement.prototype.play=function(){return Promise.reject(new DOMException('User gesture required','NotAllowedError'))};"})
-                page.call("Page.navigate", {"url": "https://www.youtube.com/"})
+                if not reuse_login:
+                    page.call("Page.navigate", {"url": "https://www.youtube.com/"})
                 deadline = time.monotonic() + 45
                 data = None
                 while time.monotonic() < deadline:
@@ -205,14 +230,15 @@ class Account:
                     data = page.evaluate(CAPTURE_SCRIPT)
                     if data and data.get("limited"):
                         raise PlatformLimited("YouTube запросил подтверждение. Автоматика остановлена на 12 часов.")
-                    if data and data.get("videos"):
+                    if data and data.get("loggedIn") is True and data.get("videos"):
                         break
                     time.sleep(1)
-                if not data or not data.get("loggedIn"):
+                if data and data.get("loggedIn") is False:
                     self.connected = False
                     self.marker.unlink(missing_ok=True)
-                    raise LoginRequired("Сессия YouTube истекла. Войди ещё раз в настройках.")
-                if not data.get("videos"):
+                    self.message = "YouTube вышел из аккаунта. Нажми «Подключить YouTube», чтобы войти снова."
+                    raise LoginRequired(self.message)
+                if not data or data.get("loggedIn") is not True or not data.get("videos"):
                     raise RuntimeError("YouTube пока не отдал рекомендации. Повторим позже, без частых запросов.")
                 unique = {v["url"]: v for v in data["videos"]}
                 # At most three continuation requests, separated by seven seconds.
@@ -228,19 +254,24 @@ class Account:
                     more = page.evaluate(CAPTURE_SCRIPT) or {}
                     if more.get("limited"):
                         raise PlatformLimited("YouTube запросил подтверждение. Автоматика остановлена на 12 часов.")
-                    if not more.get("loggedIn"):
-                        raise LoginRequired("Сессия YouTube истекла. Войди ещё раз.")
+                    if more.get("loggedIn") is not True:
+                        # Keep the known-good initial feed on a failed continuation.
+                        break
                     previous = len(unique)
                     unique.update({v["url"]: v for v in more.get("videos", [])})
                     if len(unique) == previous:
                         break
                 result = list(unique.values())[:limit]
                 self.connected = True
+                self.marker.write_text("1")
                 self.message = "YouTube подключён. Рекомендации обновляются автоматически."
                 return result
             finally:
                 page.close()
-                self.stop()
+                # The user's sign-in window is never force-closed. Its profile is
+                # reused on the next pass; background sessions close gracefully.
+                if not reuse_login:
+                    self.stop()
 
     def disconnect(self):
         self.stop()

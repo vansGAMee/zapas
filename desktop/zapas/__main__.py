@@ -1,4 +1,6 @@
 import argparse
+import logging
+from logging.handlers import RotatingFileHandler
 import os
 import sys
 import threading
@@ -16,10 +18,18 @@ def main():
     parser.add_argument("--port", type=int, default=9473)
     parser.add_argument("--data", help="Папка медиатеки")
     parser.add_argument("--import-file", help="Добавить личный видеофайл")
+    parser.add_argument("--connect-youtube", action="store_true", help="Открыть окно входа в YouTube")
     args = parser.parse_args()
     if getattr(sys, "frozen", False):
         os.environ["PATH"] = str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", "")
+    bundled_tools = Path(__file__).resolve().parents[2] / 'tools'
+    if bundled_tools.is_dir():
+        os.environ['PATH'] = str(bundled_tools) + os.pathsep + os.environ.get('PATH', '')
     store = Store(args.data)
+    handler = RotatingFileHandler(store.root / 'application.log', maxBytes=256*1024, backupCount=2, encoding='utf-8')
+    handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
+    logging.getLogger('zapas').addHandler(handler)
+    logging.getLogger('zapas').setLevel(logging.INFO)
     # Hold a process lock for the entire lifetime; reopening a library cannot start a second worker.
     lock = (store.root / "process.lock").open("a+b")
     try:
@@ -137,7 +147,7 @@ def main():
         if server.started:
             view.setUrl(QUrl(url))
             window.show()
-            if first_setup and not app.state.pipeline.account.connected:
+            if args.connect_youtube or (first_setup and not app.state.pipeline.account.connected):
                 def connect_youtube():
                     try:
                         app.state.pipeline.account.open_login()

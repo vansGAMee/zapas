@@ -36,17 +36,21 @@ data class Video(
     val id: String, val title: String, val channel: String, val duration: Double,
     val bytes: Long, val sha: String, val height: Int, val codec: String,
     val downloaded: Boolean, val position: Long, val watched: Boolean,
-    val pinned: Boolean, val updated: Double, val created: Double, val error: String = ""
+    val pinned: Boolean, val updated: Double, val created: Double, val error: String = "",
+    val liked: Boolean = false, val later: Boolean = false, val playlist: String = ""
 )
 
-class LibraryDb(context: Context) : SQLiteOpenHelper(context, "library.db", null, 2) {
+class LibraryDb(context: Context) : SQLiteOpenHelper(context, "library.db", null, 3) {
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL("""CREATE TABLE videos(id TEXT PRIMARY KEY,title TEXT NOT NULL,channel TEXT NOT NULL,
             duration REAL NOT NULL,bytes INTEGER NOT NULL,sha TEXT NOT NULL,height INTEGER NOT NULL,
             codec TEXT NOT NULL,downloaded INTEGER DEFAULT 0,position INTEGER DEFAULT 0,
-            watched INTEGER DEFAULT 0,pinned INTEGER DEFAULT 0,updated REAL DEFAULT 0,created REAL NOT NULL,error TEXT DEFAULT '')""")
+            watched INTEGER DEFAULT 0,pinned INTEGER DEFAULT 0,updated REAL DEFAULT 0,created REAL NOT NULL,error TEXT DEFAULT '',liked INTEGER DEFAULT 0,later INTEGER DEFAULT 0,playlist TEXT DEFAULT '')""")
     }
-    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) { if(oldVersion<2)db.execSQL("ALTER TABLE videos ADD COLUMN error TEXT DEFAULT ''") }
+    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+        if(oldVersion<2)db.execSQL("ALTER TABLE videos ADD COLUMN error TEXT DEFAULT ''")
+        if(oldVersion<3){db.execSQL("ALTER TABLE videos ADD COLUMN liked INTEGER DEFAULT 0");db.execSQL("ALTER TABLE videos ADD COLUMN later INTEGER DEFAULT 0");db.execSQL("ALTER TABLE videos ADD COLUMN playlist TEXT DEFAULT ''")}
+    }
 }
 
 class TokenVault(context: Context) {
@@ -76,6 +80,7 @@ class Repository(val context: Context) {
     private val db = LibraryDb(context).writableDatabase
     val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
     private val vault = TokenVault(context)
+    private val localNetwork = LocalNetwork(context)
     val videos = MutableStateFlow<List<Video>>(emptyList())
     val status = MutableStateFlow("Готово к просмотру")
     val syncing = MutableStateFlow(false)
@@ -84,6 +89,8 @@ class Repository(val context: Context) {
     val mediaDir = File(context.filesDir, "media").apply { mkdirs() }
     private val thumbs = File(context.filesDir, "thumbs").apply { mkdirs() }
     @Volatile var playingId: String? = null
+    val sleepDeadline = MutableStateFlow(0L)
+    val phonePaused get() = prefs.getBoolean("downloads_paused", false)
     val paired get() = prefs.getString("address", "").orEmpty().isNotEmpty() && vault.read().isNotEmpty()
     val address get() = prefs.getString("address", "").orEmpty()
     fun media(id: String) = File(mediaDir, "$id.mp4")
@@ -97,7 +104,7 @@ class Repository(val context: Context) {
             fun s(k: String) = c.getString(c.getColumnIndexOrThrow(k))
             fun n(k: String) = c.getLong(c.getColumnIndexOrThrow(k))
             fun d(k: String) = c.getDouble(c.getColumnIndexOrThrow(k))
-            while (c.moveToNext()) rows += Video(s("id"), s("title"), s("channel"), d("duration"), n("bytes"), s("sha"), n("height").toInt(), s("codec"), n("downloaded") == 1L && media(s("id")).exists(), n("position"), n("watched") == 1L, n("pinned") == 1L, d("updated"), d("created"), s("error"))
+            while (c.moveToNext()) rows += Video(s("id"), s("title"), s("channel"), d("duration"), n("bytes"), s("sha"), n("height").toInt(), s("codec"), n("downloaded") == 1L && media(s("id")).exists(), n("position"), n("watched") == 1L, n("pinned") == 1L, d("updated"), d("created"), s("error"),n("liked")==1L,n("later")==1L,s("playlist"))
         }
         videos.value = rows
     }
@@ -115,20 +122,40 @@ class Repository(val context: Context) {
         db.execSQL("UPDATE videos SET pinned=1-pinned WHERE id=?", arrayOf(id)); reload()
     }
 
+    fun like(id:String){db.execSQL("UPDATE videos SET liked=1-liked WHERE id=?",arrayOf(id));reload()}
+    fun later(id:String){db.execSQL("UPDATE videos SET later=1-later WHERE id=?",arrayOf(id));reload()}
+    fun playlist(id:String,name:String){db.update("videos",ContentValues().apply{put("playlist",name.trim().take(60))},"id=?",arrayOf(id));reload()}
+    fun markWatched(id:String,watched:Boolean){db.execSQL("UPDATE videos SET watched=?,position=0,updated=? WHERE id=?",arrayOf<Any>(if(watched)1 else 0,System.currentTimeMillis()/1000.0,id));reload()}
+    fun space():SpaceUsage=SpaceUsage(mediaDir.listFiles()?.filter{it.extension=="mp4"}?.sumOf{it.length()}?:0,mediaDir.listFiles()?.filter{it.extension=="part"}?.sumOf{it.length()}?:0,thumbs.listFiles()?.sumOf{it.length()}?:0,mediaDir.usableSpace)
+    fun limits():DownloadLimits {
+        val usage=space();val reserve=prefs.getInt("reserve_mb",1024).toLong()*1024*1024
+        val budget=if(prefs.getBoolean("auto_budget",false)) ((usage.free+usage.used-reserve).coerceAtLeast(0)*prefs.getInt("budget_percent",10)/100) else prefs.getInt("max_mb",8192).toLong()*1024*1024
+        return DownloadLimits(prefs.getInt("max_videos",50),budget,reserve,prefs.getInt("max_item_mb",0).toLong()*1024*1024,prefs.getInt("max_duration_min",0)*60.0)
+    }
+    fun pauseDownloads(paused:Boolean){prefs.edit().putBoolean("downloads_paused",paused).commit();if(paused){SyncWorker.cancel(context);status.value="Загрузки на паузе. Сохранённое доступно офлайн."}else{SyncWorker.schedule(context);SyncWorker.now(context)}}
+    suspend fun clearPartial()=withContext(Dispatchers.IO){mutex.withLock{mediaDir.listFiles()?.filter{it.extension in setOf("part","sha")}?.forEach{it.delete()}}}
+
     fun remove(id: String) {
         if (id == playingId) return
-        media(id).delete(); thumb(id).delete(); File(mediaDir, "$id.part").delete(); File(mediaDir, "$id.part.sha").delete()
+        media(id).delete(); File(mediaDir, "$id.part").delete(); File(mediaDir, "$id.part.sha").delete()
         db.execSQL("UPDATE videos SET downloaded=0,watched=1,updated=? WHERE id=?", arrayOf<Any>(System.currentTimeMillis()/1000.0, id)); reload()
+        var cache=thumbs.listFiles()?.sumOf{it.length()}?:0
+        videos.value.filter{!it.downloaded}.sortedBy{it.created}.forEach{old->if(cache>64L*1024*1024){val file=thumb(old.id);val length=file.length();if(file.delete())cache-=length}}
     }
 
     fun requestDownload(id: String) {
         db.execSQL("UPDATE videos SET watched=0,position=0,error='',updated=? WHERE id=?", arrayOf<Any>(System.currentTimeMillis()/1000.0, id)); reload()
     }
 
-    fun clearWatched() { videos.value.filter { it.downloaded && it.watched && !it.pinned && it.id != playingId }.forEach { remove(it.id) } }
+    fun clearWatched(automatic:Boolean=false) {
+        val cutoff=System.currentTimeMillis()/1000.0-prefs.getInt("keep_watched_days",0)*86400
+        videos.value.filter { it.downloaded && it.watched && !it.pinned && it.id != playingId && (!automatic||it.updated<=cutoff) && (!prefs.getBoolean("protect_saved",true)||!it.later&&it.playlist.isEmpty()) }.forEach { remove(it.id) }
+    }
 
     private fun validateAddress(raw: String): String {
-        val u = URI(raw.trim().trimEnd('/'))
+        val value = raw.trim().trimEnd('/').let { if ("://" in it) it else "http://$it" }
+        var u = URI(value)
+        if (u.port == -1 && u.host != null) u = URI(u.scheme, u.userInfo, u.host, 9473, u.path, u.query, u.fragment)
         require(u.scheme == "http" && u.host != null && u.userInfo == null && (u.path.isNullOrEmpty() || u.path == "/") && u.query == null && u.fragment == null) { "Введи локальный адрес с ПК: http://192.168.…:9473" }
         require(InetAddress.getAllByName(u.host).all { it.isSiteLocalAddress || it.isLoopbackAddress || it.isLinkLocalAddress }) { "Нужен локальный адрес компьютера в домашней сети" }
         require(u.port in 1..65535) { "Укажи порт из приложения на ПК, обычно 9473" }
@@ -136,7 +163,7 @@ class Repository(val context: Context) {
     }
 
     private fun connection(base: String, path: String, auth: Boolean = true): HttpURLConnection {
-        val c = URL(base + "/api/" + path).openConnection() as HttpURLConnection
+        val c = localNetwork.open(URL(base + "/api/" + path))
         c.connectTimeout = 5000; c.readTimeout = 20000; c.instanceFollowRedirects = false
         if (auth) c.setRequestProperty("Authorization", "Bearer " + vault.read())
         return c
@@ -159,33 +186,62 @@ class Repository(val context: Context) {
 
     suspend fun pair(rawAddress: String, code: String) = withContext(Dispatchers.IO) {
         require(code.matches(Regex("[0-9]{6}"))) { "Введи шестизначный код с компьютера" }
-        val base = validateAddress(rawAddress)
+        val candidate = if (rawAddress.isBlank()) {
+            val found = localNetwork.discover()
+            require(found.size == 1) { if (found.isEmpty()) "ПК не найден. Открой Запас на ПК и подключи телефон к той же домашней сети." else "Найдено несколько ПК. Выбери нужный компьютер." }
+            found.single().address
+        } else rawAddress
+        val base = validateAddress(candidate)
+        try {
+        val health = json(base, "health", auth = false)
+        require(health.optString("name") == "Запас" && health.optInt("version") == 1) { "По этому адресу работает другое приложение. Проверь адрес Запаса на ПК." }
         val response = json(base, "pair", JSONObject().put("code", code).put("name", android.os.Build.MODEL), false)
         vault.save(response.getString("token"))
-        prefs.edit().putString("address", base).commit()
+        prefs.edit().putString("address", base).putString("server_id", response.optString("server_id", health.optString("server_id"))).commit()
         status.value = "Компьютер подключён"
         SyncWorker.schedule(context)
+        } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+          catch (e: Exception) { throw IllegalStateException(localNetwork.error(e, base), e) }
+    }
+
+    suspend fun findComputers() = localNetwork.discover()
+    fun connectionError(e: Exception) = localNetwork.error(e, address)
+
+    private suspend fun reachableAddress(): String {
+        val saved = validateAddress(address)
+        try {
+            val health = json(saved, "health", auth=false)
+            val expected = prefs.getString("server_id", "").orEmpty()
+            if (health.optString("name") == "Запас" && (expected.isEmpty() || health.optString("server_id") == expected)) return saved
+        } catch (e: java.io.IOException) { /* IP may have changed since the last home visit. */ }
+        val id = prefs.getString("server_id", "").orEmpty()
+        val match = if (id.isNotEmpty()) localNetwork.discover().find { it.serverId == id } else null
+        if (match != null) {
+            prefs.edit().putString("address", match.address).commit()
+            return match.address
+        }
+        throw java.net.ConnectException("Домашний ПК недоступен")
     }
 
     fun disconnect() { SyncWorker.cancel(context); vault.clear(); prefs.edit().remove("address").apply(); status.value = "Компьютер отключён. Видео остаются с тобой." }
 
     private fun onWifi(): Boolean {
-        val cm = context.getSystemService(ConnectivityManager::class.java)
-        return cm.getNetworkCapabilities(cm.activeNetwork)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+        return localNetwork.network() != null
     }
 
     suspend fun sync(report: suspend (String) -> Unit = {}) = mutex.withLock {
         withContext(Dispatchers.IO) {
             if (!paired) { status.value = "Подключи компьютер в настройках"; return@withContext }
+            if (phonePaused) { status.value="Загрузки на паузе. Видео доступны офлайн.";return@withContext }
             if (!onWifi()) { status.value = "Ждём домашний Wi‑Fi. Скачанные видео доступны."; return@withContext }
             syncing.value = true
             try {
-                val base = validateAddress(address)
+                val base = reachableAddress()
                 status.value = "Проверяем медиатеку на компьютере…"
                 val quality = if (prefs.getBoolean("pending_quality", false)) {
-                    json(base, "preferences", JSONObject().put("profile", prefs.getString("profile", "balanced")).put("codec", prefs.getString("codec", "h264")))
+                    json(base, "preferences", JSONObject().put("profile", prefs.getString("profile", "balanced")).put("codec", prefs.getString("codec", "h264")).put("encoding_mode",prefs.getString("encoding_mode","smart")))
                 } else json(base, "preferences")
-                prefs.edit().putString("profile", quality.getString("profile")).putString("codec", quality.getString("codec")).putBoolean("pending_quality", false).apply()
+                prefs.edit().putString("profile", quality.getString("profile")).putString("codec", quality.getString("codec")).putString("encoding_mode",quality.optString("encoding_mode","smart")).putBoolean("pending_quality", false).apply()
                 // Batch history so years of watched items do not exceed the server's request limit.
                 for (batch in videos.value.chunked(500).ifEmpty { listOf(emptyList()) }) {
                     val items = JSONArray()
@@ -193,6 +249,7 @@ class Repository(val context: Context) {
                     json(base, "progress", JSONObject().put("items", items).put("free_bytes", mediaDir.usableSpace).put("count", videos.value.count { it.downloaded }))
                 }
                 val manifest = json(base, "manifest")
+                if(manifest.optBoolean("transfers_paused")){status.value="Передача на паузе на ПК. Уже скачанные видео доступны.";return@withContext}
                 require(manifest.getInt("version") == 1) { "Обнови приложения: версия протокола изменилась" }
                 val remote = manifest.getJSONArray("videos")
                 require(remote.length() <= 1000) { "Медиатека слишком большая" }
@@ -218,17 +275,21 @@ class Repository(val context: Context) {
                     db.setTransactionSuccessful()
                 } finally { db.endTransaction() }
                 reload()
-                if (prefs.getBoolean("delete_watched", true)) clearWatched()
-                val countLimit = prefs.getInt("max_videos", 20)
-                val byteLimit = prefs.getInt("max_mb", 2048).toLong() * 1024 * 1024
+                if (prefs.getBoolean("delete_watched", true)) clearWatched(automatic=true)
+                val limits=limits()
+                val countLimit = limits.maxCount
                 var ready = videos.value.count { it.downloaded }
-                var used = videos.value.filter { it.downloaded }.sumOf { it.bytes }
                 var downloaded = 0
                 var failed = 0
-                val candidates = videos.value.filter { !it.downloaded && !it.watched && it.id in remoteIds }
+                var transferred=0L
+                val sessionLimit=prefs.getInt("session_mb",0).toLong()*1024*1024
+                val candidates = videos.value.filter { !it.downloaded && !it.watched && it.id in remoteIds }.let { list -> when(prefs.getString("download_order","small")){"new"->list.sortedByDescending{it.created};"short"->list.sortedBy{it.duration};"later"->list.sortedByDescending{it.later};else->list.sortedBy{it.bytes}} }
                 for (v in candidates) {
                     currentCoroutineContext().ensureActive()
-                    if (ready >= countLimit || used + v.bytes > byteLimit || mediaDir.usableSpace < v.bytes + 256L*1024*1024) continue
+                    if(phonePaused)break
+                    val usage=space();val partBytes=File(mediaDir,"${v.id}.part").length()
+                    val reason=limits.reason(v,ready,usage.used,usage.free,partBytes) ?: if(sessionLimit>0&&transferred+v.bytes-partBytes>sessionLimit)"Лимит передачи за один сеанс" else null
+                    if(reason!=null){db.update("videos",ContentValues().apply{put("error",reason)},"id=?",arrayOf(v.id));continue}
                     try {
                     status.value = "Скачиваем: ${v.title}"
                     report("${ready + 1} из $countLimit · ${v.title}")
@@ -246,7 +307,7 @@ class Repository(val context: Context) {
                     } finally { tc.disconnect() }
                     download(base, v)
                     db.execSQL("UPDATE videos SET downloaded=1,error='' WHERE id=?", arrayOf(v.id))
-                    ready++; used += v.bytes; downloaded++; reload()
+                    ready++; transferred+=(v.bytes-partBytes).coerceAtLeast(0); downloaded++; reload()
                     } catch (e: kotlinx.coroutines.CancellationException) {
                         throw e
                     } catch (e: java.io.IOException) {
@@ -263,6 +324,8 @@ class Repository(val context: Context) {
                 status.value = when {
                     failed > 0 -> "$ready видео готовы. $failed не скачались — их можно повторить в «Загрузках»."
                     candidates.size > downloaded -> "$ready видео готовы. Остальные ждут места в лимите."
+                    manifest.optBoolean("paused") -> "$ready видео готовы. Подготовка новых на ПК приостановлена."
+                    manifest.optInt("pending")>0 -> "$ready видео готовы. ПК готовит ещё ${manifest.optInt("pending")}. Подхватим автоматически."
                     ready == 0 -> "На ПК пока нет новых готовых видео"
                     else -> "$ready видео с тобой. Можно без интернета."
                 }
@@ -287,6 +350,8 @@ class Repository(val context: Context) {
                     val buffer = ByteArray(128*1024)
                     while (true) {
                         currentCoroutineContext().ensureActive()
+                        check(!phonePaused){"Загрузки приостановлены"}
+                        check(mediaDir.usableSpace >= prefs.getInt("reserve_mb",1024).toLong()*1024*1024){"Остановлено, чтобы сохранить свободное место телефона"}
                         val n = input.read(buffer); if (n < 0) break
                         total += n; check(total <= v.bytes) { "Размер видео изменился. Повтори синхронизацию." }
                         out.write(buffer, 0, n); transfer.value = total.toFloat() / v.bytes
