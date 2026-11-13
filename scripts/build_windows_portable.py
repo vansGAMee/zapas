@@ -40,7 +40,7 @@ with zipfile.ZipFile(python_zip) as archive:
 (runtime / 'python313._pth').write_text('python313.zip\n.\nLib/site-packages\n../desktop\nimport site\n')
 wheels = CACHE / 'wheels'
 wheels.mkdir(exist_ok=True)
-subprocess.run([sys.executable, '-m', 'pip', 'download', '--disable-pip-version-check', '--only-binary=:all:', '--platform','win_amd64','--python-version','3.13','--implementation','cp','--abi','cp313','--dest',str(wheels),'-r',str(ROOT/'desktop/requirements.txt')], check=True)
+subprocess.run([sys.executable, '-m', 'pip', 'download', '--disable-pip-version-check', '--only-binary=:all:', '--platform','win_amd64','--python-version','3.13','--implementation','cp','--abi','cp313','--dest',str(wheels),'-r',str(ROOT/'desktop/requirements.txt'),'colorama>=0.4.6,<0.5'], check=True)
 packages = runtime / 'Lib/site-packages'
 packages.mkdir(parents=True, exist_ok=True)
 for wheel in wheels.glob('*.whl'):
@@ -74,6 +74,7 @@ apk=ROOT/'android/app/build/outputs/apk/debug/app-debug.apk'
 if apk.exists():shutil.copy2(apk,OUT/'desktop/Zapas.apk')
 for name in ('README.md','LICENSE','THIRD_PARTY_NOTICES.md'):
     shutil.copy2(ROOT/name,OUT/name)
+shutil.copy2(ROOT/'docs/WINDOWS-START.txt', OUT/'00-НАЧНИ-ЗДЕСЬ.txt')
 (OUT/'Запустить.cmd').write_text('@echo off\r\ncd /d "%~dp0"\r\nstart "" "%~dp0runtime\\pythonw.exe" -m zapas %*\r\n',encoding='utf-8')
 (OUT/'Проверить.cmd').write_text('@echo off\r\nchcp 65001 >nul\r\ncd /d "%~dp0"\r\n"%~dp0runtime\\python.exe" -m zapas --headless\r\npause\r\n',encoding='ascii')
 shutil.copy2(ROOT/'scripts/windows-network.ps1', OUT/'setup-network.ps1')

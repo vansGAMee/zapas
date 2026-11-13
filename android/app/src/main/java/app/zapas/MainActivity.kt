@@ -98,7 +98,7 @@ class MainActivity : ComponentActivity() {
         runCatching{setPictureInPictureParams(builder.build())}
     }
     fun enterPip(){if(pipEligible && packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_PICTURE_IN_PICTURE))runCatching{enterPictureInPictureMode(android.app.PictureInPictureParams.Builder().setAspectRatio(android.util.Rational(16,9)).build())}}
-    override fun onUserLeaveHint(){super.onUserLeaveHint();if(Build.VERSION.SDK_INT<31)enterPip()}
+    override fun onUserLeaveHint(){super.onUserLeaveHint();if(!isInPictureInPictureMode)enterPip()}
     override fun onNewIntent(intent: android.content.Intent) { super.onNewIntent(intent); readLink(intent.data) }
     private fun readLink(uri: Uri?) { if(uri?.scheme=="zapas"&&uri.host=="pair") incoming.value=Pair(uri.getQueryParameter("address").orEmpty(),uri.getQueryParameter("code").orEmpty()) }
 }

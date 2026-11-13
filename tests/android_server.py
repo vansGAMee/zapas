@@ -1,6 +1,7 @@
 """Real media transfer fixture for the Android integration run. Local machine only."""
 import json
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -16,8 +17,17 @@ root = Path(__file__).resolve().parents[1]
 data = root / 'artifacts/test-library/android-connection'
 store = Store(data)
 app = create_app(store, start_worker=False, port=19473)
-sample = next((root / 'artifacts/test-library/live/media').glob('*.mp4'))
-thumb = next((root / 'artifacts/test-library/live/thumbs').glob('*.jpg'))
+sample = next((root / 'artifacts/test-library/live/media').glob('*.mp4'), None)
+thumb = next((root / 'artifacts/test-library/live/thumbs').glob('*.jpg'), None)
+if sample is None or thumb is None:
+    fixture = root / 'artifacts/test-library/generated'
+    fixture.mkdir(parents=True, exist_ok=True)
+    sample, thumb = fixture / 'source.mp4', fixture / 'cover.jpg'
+    subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i',
+                    'testsrc2=size=320x180:rate=25', '-t', '20', '-c:v', 'libx264',
+                    '-threads', '1', '-pix_fmt', 'yuv420p', str(sample)], check=True, timeout=60)
+    subprocess.run(['ffmpeg', '-v', 'error', '-y', '-i', str(sample), '-frames:v', '1',
+                    '-threads', '1', str(thumb)], check=True, timeout=30)
 duration, info = probe(sample)
 for i in range(2):
     key = f'{i+1:024x}'
