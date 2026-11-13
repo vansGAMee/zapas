@@ -53,8 +53,10 @@ def main():
             parser.error("Видео не найдено")
         app.state.pipeline.enqueue(local=args.import_file)
     url = f"http://127.0.0.1:{args.port}/#" + app.state.admin_token
-    server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=args.port, log_level="warning"))
+    server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=args.port, log_level="warning", use_colors=False))
     if args.headless:
+        if hasattr(sys.stdout, 'reconfigure'):
+            sys.stdout.reconfigure(encoding='utf-8')
         print("Открой интерфейс на этом компьютере:\n" + url, flush=True)
         server.run()
         return

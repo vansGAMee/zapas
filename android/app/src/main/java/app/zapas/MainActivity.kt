@@ -82,12 +82,21 @@ internal fun duration(n: Double): String { val s=n.toInt(); return if(s>=3600) "
 class MainActivity : ComponentActivity() {
     val pip = mutableStateOf(false)
     var pipEligible=false
+    private var pipSourceBounds: android.graphics.Rect? = null
     private val incoming = mutableStateOf<Pair<String,String>?>(null)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState); enableEdgeToEdge(); readLink(intent?.data)
         setContent { ZapasApp(incoming.value) { incoming.value=null } }
     }
     override fun onPictureInPictureModeChanged(inPictureInPictureMode:Boolean,newConfig:android.content.res.Configuration){super.onPictureInPictureModeChanged(inPictureInPictureMode,newConfig);pip.value=inPictureInPictureMode}
+    fun updatePipParams(enabled:Boolean,bounds:android.graphics.Rect?=null){
+        pipEligible=enabled
+        if(bounds!=null&&!bounds.isEmpty)pipSourceBounds=android.graphics.Rect(bounds)
+        val builder=android.app.PictureInPictureParams.Builder().setAspectRatio(android.util.Rational(16,9))
+        pipSourceBounds?.let{builder.setSourceRectHint(it)}
+        if(Build.VERSION.SDK_INT>=31)builder.setAutoEnterEnabled(enabled)
+        runCatching{setPictureInPictureParams(builder.build())}
+    }
     fun enterPip(){if(pipEligible && packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_PICTURE_IN_PICTURE))runCatching{enterPictureInPictureMode(android.app.PictureInPictureParams.Builder().setAspectRatio(android.util.Rational(16,9)).build())}}
     override fun onUserLeaveHint(){super.onUserLeaveHint();if(Build.VERSION.SDK_INT<31)enterPip()}
     override fun onNewIntent(intent: android.content.Intent) { super.onNewIntent(intent); readLink(intent.data) }

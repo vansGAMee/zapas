@@ -19,6 +19,7 @@ import urllib.request
 bundle = Path(sys.argv[1]).resolve()
 os.environ['PATH'] = str(bundle / 'tools') + os.pathsep + os.environ.get('PATH', '')
 os.environ['QT_QPA_PLATFORM'] = 'offscreen'
+os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = '--disable-gpu --disable-dev-shm-usage'
 from PySide6.QtWidgets import QApplication
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from zapas.media import Pipeline, probe
@@ -102,21 +103,26 @@ with tempfile.TemporaryDirectory(prefix='zapas-check-') as tmp:
     entry = Store(root / 'entry')
     entry.save_settings({'paused': True, 'transfers_paused': True, 'setup_complete': True})
     command = [sys.executable, '-m', 'zapas', '--headless', '--data', str(entry.root), '--port', str(port)]
-    process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    try:
-        for _ in range(100):
-            assert process.poll() is None, 'Entry point exited before startup'
-            try:
-                if document('/api/health')['app_version'] == '0.2.0':
-                    break
-            except OSError:
-                time.sleep(.1)
-        else:
-            raise AssertionError('Entry point startup timed out')
-        other = subprocess.run(command, capture_output=True, timeout=20)
-        assert other.returncode == 2, 'Single instance lock failed'
-    finally:
-        process.terminate()
-        process.wait(timeout=20)
-        process.stderr.close()
-print('WINDOWS_PORTABLE_OK: Qt, Node, FFmpeg, SQLite, HTTP, APK, pairing, Range, SHA256, transfer pause, entry point, process lock')
+    gui = [str(bundle / 'runtime/pythonw.exe'), '-c',
+           'import sys; sys.stdout = sys.stderr = None; from zapas.__main__ import main; main()',
+           '--data', str(entry.root), '--port', str(port)]
+    for launch in (command, gui):
+        process = subprocess.Popen(launch, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            for _ in range(150):
+                if process.poll() is not None:
+                    raise AssertionError('Entry point exited before startup: ' + process.stderr.read().decode(errors='replace')[-3000:])
+                try:
+                    if document('/api/health')['app_version'] == '0.2.0':
+                        break
+                except OSError:
+                    time.sleep(.1)
+            else:
+                raise AssertionError('Entry point startup timed out')
+            other = subprocess.run(command, capture_output=True, timeout=20)
+            assert other.returncode == 2, 'Single instance lock failed'
+        finally:
+            process.terminate()
+            process.wait(timeout=20)
+            process.stderr.close()
+print('WINDOWS_PORTABLE_OK: Qt, Node, FFmpeg, SQLite, HTTP, APK, pairing, Range, SHA256, transfer pause, console and GUI entry points, process lock')

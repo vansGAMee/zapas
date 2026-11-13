@@ -48,11 +48,12 @@ internal fun WatchScreen(v:Video,player:MediaController?,repo:Repository,error:S
     var full by rememberSaveable{mutableStateOf(false)}
     var locked by rememberSaveable{mutableStateOf(false)}
     var playing by remember(player){mutableStateOf(player?.isPlaying==true)}
+    var controlsVisible by remember(player){mutableStateOf(true)}
     var speed by remember(player){mutableFloatStateOf(player?.playbackParameters?.speed?:1f)}
     var repeat by remember(player){mutableStateOf(player?.repeatMode==Player.REPEAT_MODE_ONE)}
     var fit by remember{mutableStateOf(repo.prefs.getString("video_fit","fit"))}
-    DisposableEffect(player){val listener=object:Player.Listener{override fun onIsPlayingChanged(isPlaying:Boolean){playing=isPlaying}};player?.addListener(listener);onDispose{player?.removeListener(listener);activity?.pipEligible=false}}
-    SideEffect {val enabled=playing&&repo.prefs.getBoolean("pip",true);activity?.pipEligible=enabled;if(Build.VERSION.SDK_INT>=31)runCatching{activity?.setPictureInPictureParams(PictureInPictureParams.Builder().setAspectRatio(Rational(16,9)).setAutoEnterEnabled(enabled).build())}}
+    DisposableEffect(player){val listener=object:Player.Listener{override fun onIsPlayingChanged(isPlaying:Boolean){playing=isPlaying}};player?.addListener(listener);onDispose{player?.removeListener(listener);activity?.updatePipParams(false)}}
+    SideEffect {activity?.updatePipParams(playing&&repo.prefs.getBoolean("pip",true))}
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val mode=repo.prefs.getString("screen_mode","auto")
         val wide=maxWidth>=840.dp
@@ -63,15 +64,16 @@ internal fun WatchScreen(v:Video,player:MediaController?,repo:Repository,error:S
             Box(modifier.background(Color.Black)) {
                 AndroidView(factory={ctx->PlayerView(ctx).apply{
                     this.player=player;setShowNextButton(true);setShowPreviousButton(true);setShowRewindButton(true);setShowFastForwardButton(true);setShowSubtitleButton(false)
+                    setControllerVisibilityListener(PlayerView.ControllerVisibilityListener{visibility->controlsVisible=visibility==android.view.View.VISIBLE})
                     findViewById<android.view.View>(androidx.media3.ui.R.id.exo_settings)?.visibility=android.view.View.GONE
-                    addOnLayoutChangeListener{view,_,_,_,_,_,_,_,_->if(activity?.isInPictureInPictureMode==false){val bounds=Rect();view.getGlobalVisibleRect(bounds);runCatching{activity.setPictureInPictureParams(PictureInPictureParams.Builder().setAspectRatio(Rational(16,9)).setSourceRectHint(bounds).build())}}}
+                    addOnLayoutChangeListener{view,_,_,_,_,_,_,_,_->if(activity?.isInPictureInPictureMode==false){val bounds=Rect();view.getGlobalVisibleRect(bounds);activity.updatePipParams(activity.pipEligible,bounds)}}
                 }},update={view->view.player=player;view.keepScreenOn=playing;view.useController=!locked&&!pip;view.resizeMode=if(fit=="zoom")AspectRatioFrameLayout.RESIZE_MODE_ZOOM else AspectRatioFrameLayout.RESIZE_MODE_FIT},onRelease={it.player=null},modifier=Modifier.fillMaxSize())
-                if(!pip)Row(Modifier.align(Alignment.TopEnd).background(Color.Black.copy(alpha=.35f)),verticalAlignment=Alignment.CenterVertically){
+                if(!pip&&(controlsVisible||locked))Row(Modifier.align(Alignment.TopEnd).background(Color.Black.copy(alpha=.35f)),verticalAlignment=Alignment.CenterVertically){
                     if(!locked){IconButton(onClick={full=!full}){Icon(if(fullscreen)Icons.Outlined.FullscreenExit else Icons.Outlined.Fullscreen,"Полный экран",tint=Color.White,modifier=Modifier.size(24.dp))};IconButton(onClick={settings=true}){Icon(Icons.Rounded.Settings,"Настройки плеера",tint=Color.White,modifier=Modifier.size(24.dp))}}
                     IconButton(onClick={locked=!locked}){Icon(if(locked)Icons.Outlined.Lock else Icons.Outlined.LockOpen,if(locked)"Разблокировать управление" else "Заблокировать управление",tint=Color.White,modifier=Modifier.size(24.dp))}
                 }
-                if(fullscreen&&!locked&&!pip)IconButton(onClick={if(full)full=false else onBack()},modifier=Modifier.align(Alignment.TopStart)){Icon(Icons.AutoMirrored.Outlined.ArrowBack,"Свернуть плеер",tint=Color.White)}
-                if(!locked&&!pip)Row(Modifier.align(Alignment.BottomCenter).padding(bottom=64.dp),horizontalArrangement=Arrangement.spacedBy(16.dp)){
+                if(fullscreen&&!locked&&!pip&&controlsVisible)IconButton(onClick={if(full)full=false else onBack()},modifier=Modifier.align(Alignment.TopStart)){Icon(Icons.AutoMirrored.Outlined.ArrowBack,"Свернуть плеер",tint=Color.White)}
+                if(!locked&&!pip&&controlsVisible)Row(Modifier.align(Alignment.BottomCenter).padding(bottom=64.dp),horizontalArrangement=Arrangement.spacedBy(16.dp)){
                     val step=repo.prefs.getInt("seek_seconds",10)*1000L
                     FilledTonalIconButton(onClick={player?.seekTo(((player.currentPosition)-step).coerceAtLeast(0))}){Icon(Icons.Outlined.Replay,"Назад ${step/1000} секунд")}
                     FilledTonalIconButton(onClick={player?.seekTo((player.currentPosition+step).coerceAtMost(player.duration.coerceAtLeast(0)))}){Icon(Icons.Outlined.Forward10,"Вперёд ${step/1000} секунд")}
