@@ -12,6 +12,9 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+
 ROOT = Path(__file__).resolve().parents[1]
 CACHE = ROOT / '.private/windows-build'
 OUT = ROOT / 'dist/Запас-Windows'
