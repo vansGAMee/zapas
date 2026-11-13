@@ -61,7 +61,7 @@ H.264 — начальный совместимый вариант. Есть HEV
 
 На этом Arch Linux окружение подготовлено: `./start.sh`. Нужны FFmpeg/ffprobe, Node.js либо Deno и Chrome/Chromium/Edge. Python-зависимости — `desktop/requirements.txt`.
 
-Windows 10/11 x64: переносимая сборка `Запас-Windows` содержит Python, Qt, FFmpeg, ffprobe и Node. Распакуй всю папку и запусти `Запустить.cmd`. Chrome/Edge используется уже установленный. Если брандмауэр мешает телефону, `Настроить-сеть.ps1` создаёт правила только для частной локальной сети. Проверка через Wine не заменяет испытание на настоящей Windows.
+Windows 10/11 x64: переносимая сборка `Запас-Windows` содержит Python, Qt, FFmpeg, ffprobe и Node. Распакуй всю папку и запусти `Запустить.cmd`. Chrome/Edge используется уже установленный. Если брандмауэр мешает телефону, запусти `Настроить-сеть.cmd`: помощник запрашивает права администратора и создаёт правила только для частной локальной сети. Проверка через Wine не заменяет испытание на настоящей Windows.
 
 Windows: исходный вариант `start.bat` требует Python 3.11+, FFmpeg/ffprobe и Node.js/Deno в PATH. `.github/workflows/build.yml` запускает сборку и проверку переносимого комплекта на Windows через `scripts/build_windows_portable.py`; сведения о выполненных проверках — в `docs/VALIDATION.md`.
 

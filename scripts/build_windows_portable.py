@@ -76,6 +76,7 @@ for name in ('README.md','LICENSE','THIRD_PARTY_NOTICES.md'):
     shutil.copy2(ROOT/name,OUT/name)
 (OUT/'Запустить.cmd').write_text('@echo off\r\ncd /d "%~dp0"\r\nstart "" "%~dp0runtime\\pythonw.exe" -m zapas %*\r\n',encoding='utf-8')
 (OUT/'Проверить.cmd').write_text('@echo off\r\ncd /d "%~dp0"\r\n"%~dp0runtime\\python.exe" -m zapas --headless\r\npause\r\n',encoding='utf-8')
-shutil.copy2(ROOT/'scripts/windows-network.ps1', OUT/'Настроить-сеть.ps1')
+shutil.copy2(ROOT/'scripts/windows-network.ps1', OUT/'setup-network.ps1')
+(OUT/'Настроить-сеть.cmd').write_text('@echo off\r\npowershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0setup-network.ps1"\r\npause\r\n', encoding='ascii')
 (OUT/'build-info.json').write_text(json.dumps({'python':version,'node':node_version,'platform':'windows-x64','app':'0.2.0'},indent=2))
 print('Windows folder ready:', OUT, flush=True)

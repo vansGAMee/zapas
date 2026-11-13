@@ -104,6 +104,8 @@ private fun ZapasApp(incoming: Pair<String,String>?, consumeLink: ()->Unit) {
     var delete by remember { mutableStateOf<Video?>(null) }; var disconnect by remember { mutableStateOf(false) }; var clear by remember { mutableStateOf(false) }
     var dark by rememberSaveable { mutableStateOf(repo.prefs.getBoolean("dark",true)) }
     var controller by remember { mutableStateOf<MediaController?>(null) }; var current by remember { mutableStateOf<String?>(null) }; var mini by rememberSaveable { mutableStateOf(false) }
+    var pendingPlay by remember { mutableStateOf<String?>(null) }
+    var connectionError by remember { mutableStateOf("") }
     var error by remember { mutableStateOf("") }; val snackbar=remember { SnackbarHostState() }; val scope=rememberCoroutineScope()
     val notification=rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
     fun sync() { if(!repo.paired) showPair=true else { if(Build.VERSION.SDK_INT>=33) notification.launch(Manifest.permission.POST_NOTIFICATIONS); SyncWorker.now(context) } }
@@ -116,12 +118,12 @@ private fun ZapasApp(incoming: Pair<String,String>?, consumeLink: ()->Unit) {
                 override fun onMediaItemTransition(item: MediaItem?, reason: Int) { current=item?.mediaId }
                 override fun onPlayerError(e: androidx.media3.common.PlaybackException) { error="Не удалось открыть видео. Попробуй H.264 для следующих загрузок. ${e.errorCodeName}" }
             })
-        } },ContextCompat.getMainExecutor(context))
+        }.onFailure { connectionError="Не удалось запустить плеер. Открой приложение заново." } },ContextCompat.getMainExecutor(context))
         onDispose { MediaController.releaseFuture(future) }
     }
     fun play(v: Video) {
         if(!v.downloaded){repo.requestDownload(v.id);sync();return}
-        val p=controller ?: return
+        val p=controller ?: run { pendingPlay=v.id;return }
         val ordered=listOf(v)+videos.filter { it.downloaded&&it.id!=v.id&&!it.watched }
         val list=(if(repo.prefs.getBoolean("autoplay",true)) ordered else listOf(v)).map { item ->
             MediaItem.Builder().setMediaId(item.id).setUri(Uri.fromFile(repo.media(item.id)))
@@ -129,6 +131,8 @@ private fun ZapasApp(incoming: Pair<String,String>?, consumeLink: ()->Unit) {
         }
         p.setMediaItems(list,0,if(v.watched)0 else v.position); p.prepare(); p.play(); current=v.id; mini=false; error=""
     }
+    LaunchedEffect(controller,pendingPlay){if(controller!=null&&pendingPlay!=null){val id=pendingPlay;pendingPlay=null;videos.find{it.id==id}?.let{play(it)}}}
+    LaunchedEffect(connectionError){if(connectionError.isNotEmpty())snackbar.showSnackbar(connectionError)}
     val lifecycleOwner=LocalLifecycleOwner.current
     LaunchedEffect(lifecycleOwner){lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED){while(true){if(repo.paired&&!repo.phonePaused&&repo.prefs.getBoolean("auto_sync",true))SyncWorker.now(context);delay(30_000)}}}
     val activity=LocalActivity.current as? MainActivity

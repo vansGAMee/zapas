@@ -19,6 +19,7 @@ PROFILES = {
     "balanced": {"height": 720, "crf": 25, "audio": "96k", "name": "Баланс"},
     "quality": {"height": 1080, "crf": 21, "audio": "128k", "name": "Качество"},
 }
+NO_CONSOLE = getattr(subprocess, 'CREATE_NO_WINDOW', 0) if os.name == 'nt' else 0
 
 
 def youtube_url(url):
@@ -53,7 +54,7 @@ def offline_reason(info):
 
 
 def probe(path):
-    r = subprocess.run(["ffprobe", "-v", "error", "-show_format", "-show_streams", "-of", "json", str(path)], capture_output=True, check=True, timeout=60)
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_format", "-show_streams", "-of", "json", str(path)], capture_output=True, check=True, timeout=60, creationflags=NO_CONSOLE)
     d = json.loads(r.stdout)
     v = next((s for s in d["streams"] if s["codec_type"] == "video"), None)
     if not v:
@@ -328,7 +329,7 @@ class Pipeline:
             # stderr goes to a file, avoiding a full-pipe deadlock on long encodes.
             with open(work / "ffmpeg.log", "w+") as log:
                 proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=log, text=True,
-                                        creationflags=subprocess.BELOW_NORMAL_PRIORITY_CLASS if os.name == "nt" else 0)
+                                        creationflags=(subprocess.BELOW_NORMAL_PRIORITY_CLASS | NO_CONSOLE) if os.name == "nt" else 0)
                 if os.name == "posix":
                     try:
                         os.setpriority(os.PRIO_PROCESS, proc.pid, 15)
@@ -353,7 +354,7 @@ class Pipeline:
                     raise RuntimeError("FFmpeg: " + log.read()[-600:])
             if compatible and not copy_video and dst.stat().st_size > src.stat().st_size:
                 # Re-encoding an efficient source must not make the stored file larger.
-                subprocess.run(remux_args(src, dst, cfg['profile'], copy_audio), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=max(120, duration))
+                subprocess.run(remux_args(src, dst, cfg['profile'], copy_audio), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=max(120, duration), creationflags=NO_CONSOLE)
             _, stream = probe(dst)
             total = self.s.one("SELECT coalesce(sum(bytes),0) AS n FROM videos WHERE state='ready'")["n"]
             if total + dst.stat().st_size > cfg["max_gb"] * 1024**3:
@@ -366,7 +367,7 @@ class Pipeline:
                     im.thumbnail((640, 360))
                     im.convert("RGB").save(thumb, quality=82)
             else:
-                subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", str(min(3, duration / 3)), "-i", str(dst), "-frames:v", "1", "-vf", "scale=640:-2", str(thumb)], capture_output=True, timeout=90, check=True)
+                subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", str(min(3, duration / 3)), "-i", str(dst), "-frames:v", "1", "-vf", "scale=640:-2", str(thumb)], capture_output=True, timeout=90, check=True, creationflags=NO_CONSOLE)
             final = self.s.root / "media" / f"{key}.mp4"
             dst.replace(final)
             self.s.update_video(key, state="ready", progress=1, bytes=final.stat().st_size, sha256=sha256(final), media=final.name, thumb=thumb.name, height=stream["height"], codec=cfg["codec"], channel=item["channel"] or ("Личное видео" if item["local_path"] else self.s.one("SELECT channel FROM videos WHERE id=?", (key,))["channel"]))
