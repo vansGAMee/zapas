@@ -1,0 +1,52 @@
+name: Publish verified Windows bundle
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Successful Windows build run
+        required: true
+        type: string
+      tag:
+        description: Existing release tag
+        required: true
+        default: v0.2.0
+        type: string
+permissions:
+  contents: write
+  actions: read
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Zapas-Windows
+          path: bundle
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+      - name: Include the same Android signature as the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release download "$RELEASE_TAG" --pattern 'Zapas-*.apk' --pattern '*-source.zip' --dir bundle
+          python - <<'PY'
+          import os, zipfile, pathlib, hashlib
+          root=pathlib.Path('bundle')
+          apk=next(root.glob('*.apk'))
+          target=root/f"Zapas-{os.environ['RELEASE_TAG'].removeprefix('v')}-Windows-x64.zip"
+          with zipfile.ZipFile(root/'Zapas-Windows.zip') as old, zipfile.ZipFile(target,'w',zipfile.ZIP_DEFLATED,compresslevel=3) as new:
+              for item in old.infolist():
+                  if not item.filename.endswith('/Zapas.apk'):
+                      new.writestr(item,old.read(item))
+                  else:
+                      new.writestr(item,apk.read_bytes())
+          with zipfile.ZipFile(target) as result:
+              assert result.testzip() is None
+          lines=[]
+          for path in (target,apk,next(root.glob('*-source.zip'))):
+              with path.open('rb') as f: lines.append(hashlib.file_digest(f,'sha256').hexdigest()+'  '+path.name)
+          (root/'SHA256SUMS.txt').write_text('\n'.join(lines)+'\n')
+          PY
+          gh release upload "$RELEASE_TAG" bundle/*-Windows-x64.zip bundle/SHA256SUMS.txt --clobber
